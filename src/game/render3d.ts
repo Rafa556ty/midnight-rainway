@@ -47,14 +47,20 @@ import {
   SPEED_RADARS,
   TUNNEL_FROM,
   TUNNEL_TO,
+  WATER_FROM,
+  WATER_TO,
   cyc,
   inCity,
   inTunnel,
   lightsOn,
   nightAmount,
+  overWater,
   rainAmount,
+  sunsetAmount,
+  zoneAt,
 } from "./world";
 import { MapScenery } from "./map-scenery";
+import { oncomingCars } from "./oncoming";
 
 const LANE_W = 3.6;
 const ROAD_W = LANE_W * 3;
@@ -382,12 +388,18 @@ export class Scene3D {
   private lampPoolMat!: THREE.MeshBasicMaterial;
 
   private tunnel!: THREE.Group;
+  private tunnelFallback!: THREE.Group;
   private map!: MapScenery;
+  /** Ground hidden over the river (grass / gravel). */
+  private waterClip = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)];
   /** Highway guardrail hidden inside the city. */
   private cityCutClip = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)];
   /** Second carriageway shown only inside the city. */
   private cityKeepClip = [new THREE.Plane(new THREE.Vector3(0, 0, -1), 0), new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)];
   private leftRoadMat!: THREE.MeshStandardMaterial;
+  private sunsetColor = new THREE.Color(0xe8945a);
+  private sunWhite = new THREE.Color(0xfff1dc);
+  private sunGold = new THREE.Color(0xffa45c);
   private tunnelLightMat!: THREE.MeshStandardMaterial;
   private tunnelLamp: THREE.PointLight;
   private bridges: THREE.Group[] = [];
@@ -548,6 +560,7 @@ export class Scene3D {
     this.map = new MapScenery(this.scene, this.low, VIEW_AHEAD, VIEW_BEHIND);
     void this.map.load().then(async (root) => {
       if (this.disposed) return;
+      this.tunnelFallback.visible = false;
       try { await this.renderer.compileAsync(root, this.camera, this.scene); } catch { /* compile on first draw */ }
       this.canvas.dataset["mapReady"] = "true";
     }).catch((e) => console.error("map models failed", e));
@@ -634,8 +647,8 @@ export class Scene3D {
     road.receiveShadow = true;
     this.scene.add(road);
 
-    const gravelMat = new THREE.MeshStandardMaterial({ color: 0x77706a, roughness: 1 });
-    const grassMat = new THREE.MeshStandardMaterial({ map: this.grassTex, roughness: 1 });
+    const gravelMat = new THREE.MeshStandardMaterial({ color: 0x77706a, roughness: 1, clippingPlanes: this.waterClip, clipIntersection: true });
+    const grassMat = new THREE.MeshStandardMaterial({ map: this.grassTex, roughness: 1, clippingPlanes: this.waterClip, clipIntersection: true });
     const railMat = new THREE.MeshStandardMaterial({ color: 0xc4c8cc, metalness: 0.85, roughness: 0.35, clippingPlanes: this.cityCutClip, clipIntersection: true });
     // Oncoming carriageway of the city avenue (mirrored so lane paint lines up).
     this.leftRoadMat = new THREE.MeshStandardMaterial({ map: this.roadTex, roughness: 0.88, metalness: 0.02, clippingPlanes: this.cityKeepClip });
@@ -1876,18 +1889,6 @@ export class Scene3D {
   }
 
   private layoutScenery(pz: number, night: number) {
-    // City stretch: owner city models, no guardrail, second carriageway shown.
-    this.map?.update(pz, night);
-    {
-      const len = CITY_TO - CITY_FROM;
-      let w = pz - cyc(pz) + CITY_FROM;
-      if (w + len < pz - VIEW_BEHIND - 60) w += CYCLE;
-      const cz = -(w - pz);
-      this.cityCutClip[0]!.constant = -cz;
-      this.cityCutClip[1]!.constant = cz - len;
-      this.cityKeepClip[0]!.constant = cz;
-      this.cityKeepClip[1]!.constant = -(cz - len);
-    }
     const m = this.matrix;
     const q = this.quaternion;
     const sc = this.scaleVector;
@@ -1932,7 +1933,6 @@ export class Scene3D {
     for (let n = first; i < 159; n++) {
       const z = n * 4;
       if (z > pz + 160) break;
-      if (inCity(z)) continue;
       for (const s of [-1, 1]) {
         m.makeTranslation(s * (DECK_W / 2 + 0.55), 0, -(z - pz));
         this.posts.setMatrixAt(i++, m);
@@ -1949,7 +1949,7 @@ export class Scene3D {
       if (z > pz + (this.low ? 120 : VIEW_AHEAD)) break;
       for (const s of [-1, 1]) {
         const hsh = hash(n * 2 + (s > 0 ? 1 : 0));
-        if (hsh < 0.25 || tunnelAt(z) || inCity(z)) continue;
+        if (hsh < 0.25 || tunnelAt(z)) continue;
         const x = s * (DECK_W / 2 + 6 + hsh * 26);
         const k = 0.7 + hash(n * 7.3 + s) * 0.9;
         pos.set(x, 0, -(z - pz));

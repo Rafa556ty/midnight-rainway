@@ -1,50 +1,67 @@
-// Scenery cycle along the road (pure, unit-tested). Distances are in HUD meters.
-// Cycle: City (start) -> Day Highway -> Tunnel -> Rainy Dusk -> Night Highway -> Dawn -> City...
-// The original highway layout is kept as is, just pushed back by the city stretch.
+// Map layout along the road (pure, unit-tested). Distances are in HUD meters.
+// One lap of the cycle:
+//   City (day) -> Day highway -> Suspension bridge over water (sunset)
+//   -> Twin-bore tunnel -> Night highway with rain -> Dawn -> City...
 
 export type Theme = "day" | "tunnel" | "night";
+export type Zone = "city" | "highway" | "bridge" | "tunnel" | "night-highway";
 
 export const CITY_FROM = 0;
 export const CITY_TO = 1300;
-const O = CITY_TO; // original layout offset
+export const BRIDGE_FROM = 2500;
+/** Bridge model length in metres (owner-supplied suspension bridge, flattened). */
+export const BRIDGE_LEN = 490;
+export const BRIDGE_TO = BRIDGE_FROM + BRIDGE_LEN;
+/** Open water under the bridge (between the two abutments). */
+export const WATER_FROM = BRIDGE_FROM + 70;
+export const WATER_TO = BRIDGE_FROM + 420;
 
-export const TUNNEL_FROM = O + 1400;
-export const TUNNEL_TO = O + 2400;
-export const DUSK_FROM = TUNNEL_TO; // gets dark gradually after tunnel
-export const NIGHT_FROM = O + 3400; // fully night when the night highway starts
-export const DAWN_FROM = O + 5000;
-export const CYCLE = O + 5800;
+/** Straightened owner-supplied tunnel tile length (m) and tile count. */
+export const TUNNEL_TILE = 126.9;
+export const TUNNEL_TILES = 8;
+export const TUNNEL_FROM = 3150;
+export const TUNNEL_TO = Math.round(TUNNEL_FROM + TUNNEL_TILE * TUNNEL_TILES);
 
-/** Rain storm span on the highway (wet road, glossy reflections, raindrops) */
-export const RAIN_FROM = O + 2450;
-export const RAIN_TO = O + 3350;
+export const DUSK_FROM = 2600; // sky darkens slowly after the bridge
+export const NIGHT_FROM = 3800; // fully night inside the tunnel
+export const DAWN_FROM = 6100;
+export const CYCLE = 6800;
 
-/** Highway overpass bridges along the route (z positions in HUD meters) */
+/** Rain storm span on the night highway (wet road, glossy reflections, raindrops) */
+export const RAIN_FROM = 4500;
+export const RAIN_TO = 5600;
+
+/** Highway overpass bridges (only on the highways) */
 export const BRIDGES: [number, number][] = [
-  [O + 500, O + 560],
-  [O + 1100, O + 1160],
-  [O + 2800, O + 2860],
-  [O + 4100, O + 4160],
+  [1700, 1760],
+  [2250, 2310],
+  [4650, 4710],
+  [5450, 5510],
 ];
 
 /** Overhead highway sign gantries (z center positions) */
-export const SIGN_GANTRIES = [O + 300, O + 850, O + 1320, O + 2550, O + 3700, O + 4600];
+export const SIGN_GANTRIES = [1450, 2050, 4400, 5250, 5900];
 
 /** Speed trap camera radar locations (HUD meters) */
-export const SPEED_RADARS = [O + 750, O + 2050, O + 3600, O + 4750];
+export const SPEED_RADARS = [1900, 2420, 4850, 5750];
+
+/** Roadside convenience store from the owner's freeway model (shown once per lap). */
+export const STORE_AT = 5080;
 
 export const cyc = (z: number) => ((z % CYCLE) + CYCLE) % CYCLE;
 
-export const inCity = (z: number) => {
+export function zoneAt(z: number): Zone {
   const u = cyc(z);
-  return u >= CITY_FROM && u < CITY_TO;
-};
+  if (u < CITY_TO) return "city";
+  if (u >= BRIDGE_FROM && u < BRIDGE_TO) return "bridge";
+  if (u >= TUNNEL_FROM && u < TUNNEL_TO) return "tunnel";
+  if (u >= TUNNEL_TO) return "night-highway";
+  return "highway";
+}
 
 export function themeAt(z: number): Theme {
-  const u = cyc(z);
-  if (u >= TUNNEL_FROM && u < TUNNEL_TO) return "tunnel";
-  if (u >= NIGHT_FROM && u < DAWN_FROM) return "night";
-  return "day";
+  if (inTunnel(z)) return "tunnel";
+  return nightAmount(z) > 0.5 ? "night" : "day";
 }
 
 export const inTunnel = (z: number) => {
@@ -52,9 +69,23 @@ export const inTunnel = (z: number) => {
   return u >= TUNNEL_FROM && u < TUNNEL_TO;
 };
 
+export const inCity = (z: number) => cyc(z) < CITY_TO;
+
+export function overWater(z: number) {
+  const u = cyc(z);
+  return u >= WATER_FROM && u < WATER_TO;
+}
+
+/** Overpass check (kept for the 2D fallback renderer). */
 export function onBridge(z: number) {
   const u = cyc(z);
   return BRIDGES.some(([a, b]) => u >= a && u < b);
+}
+
+/** Cars come the other way on a second carriageway in the city, on the bridge and in the tunnel's other bore. */
+export function hasOncoming(z: number) {
+  const zone = zoneAt(z);
+  return zone === "city" || zone === "bridge" || zone === "tunnel";
 }
 
 const smooth = (t: number) => {
@@ -71,6 +102,16 @@ export function nightAmount(z: number) {
   return 1 - smooth((u - DAWN_FROM) / (CYCLE - DAWN_FROM));
 }
 
+/** Golden-hour warmth, strongest while crossing the bridge (0..1). */
+export function sunsetAmount(z: number) {
+  const u = cyc(z);
+  const a = BRIDGE_FROM - 400;
+  const b = TUNNEL_FROM + 100;
+  if (u < a || u > b) return 0;
+  const mid = BRIDGE_FROM + BRIDGE_LEN / 2;
+  return u < mid ? smooth((u - a) / (mid - a)) : smooth((b - u) / (b - mid));
+}
+
 /** 0 = dry, 1 = heavy rain */
 export function rainAmount(z: number): number {
   if (inTunnel(z)) return 0;
@@ -79,7 +120,7 @@ export function rainAmount(z: number): number {
   const mid = (RAIN_FROM + RAIN_TO) / 2;
   const halfSpan = (RAIN_TO - RAIN_FROM) / 2;
   const dist = Math.abs(u - mid) / halfSpan;
-  return smooth(1 - dist);
+  return smooth(Math.min(1, (1 - dist) * 1.6));
 }
 
 /** Check if car lights should be on: approaching or in tunnel, night, or raining */
