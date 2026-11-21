@@ -40,8 +40,8 @@ import { steerAngle, wheelOmega } from "./wheels";
 import { AdaptiveResolution, phoneProfile } from "./quality";
 import {
   BRIDGES,
-  CITY_FROM,
-  CITY_TO,
+  BRIDGE_FROM,
+  BRIDGE_TO,
   CYCLE,
   SIGN_GANTRIES,
   SPEED_RADARS,
@@ -50,7 +50,6 @@ import {
   WATER_FROM,
   WATER_TO,
   cyc,
-  inCity,
   inTunnel,
   lightsOn,
   nightAmount,
@@ -388,15 +387,13 @@ export class Scene3D {
   private lampPoolMat!: THREE.MeshBasicMaterial;
 
   private tunnel!: THREE.Group;
-  private tunnelFallback!: THREE.Group;
+  /** Owner tunnel model loaded: the simple box tunnel stays hidden. */
+  private newTunnel = false;
   private map!: MapScenery;
   /** Ground hidden over the river (grass / gravel). */
   private waterClip = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)];
-  /** Highway guardrail hidden inside the city. */
-  private cityCutClip = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)];
-  /** Second carriageway shown only inside the city. */
-  private cityKeepClip = [new THREE.Plane(new THREE.Vector3(0, 0, -1), 0), new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)];
-  private leftRoadMat!: THREE.MeshStandardMaterial;
+  /** Highway guardrail hidden on the suspension bridge (it has its own railings). */
+  private bridgeClip = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)];
   private sunsetColor = new THREE.Color(0xe8945a);
   private sunWhite = new THREE.Color(0xfff1dc);
   private sunGold = new THREE.Color(0xffa45c);
@@ -560,7 +557,8 @@ export class Scene3D {
     this.map = new MapScenery(this.scene, this.low, VIEW_AHEAD, VIEW_BEHIND);
     void this.map.load().then(async (root) => {
       if (this.disposed) return;
-      this.tunnelFallback.visible = false;
+      this.newTunnel = true;
+      this.tunnel.visible = false;
       try { await this.renderer.compileAsync(root, this.camera, this.scene); } catch { /* compile on first draw */ }
       this.canvas.dataset["mapReady"] = "true";
     }).catch((e) => console.error("map models failed", e));
@@ -649,15 +647,7 @@ export class Scene3D {
 
     const gravelMat = new THREE.MeshStandardMaterial({ color: 0x77706a, roughness: 1, clippingPlanes: this.waterClip, clipIntersection: true });
     const grassMat = new THREE.MeshStandardMaterial({ map: this.grassTex, roughness: 1, clippingPlanes: this.waterClip, clipIntersection: true });
-    const railMat = new THREE.MeshStandardMaterial({ color: 0xc4c8cc, metalness: 0.85, roughness: 0.35, clippingPlanes: this.cityCutClip, clipIntersection: true });
-    // Oncoming carriageway of the city avenue (mirrored so lane paint lines up).
-    this.leftRoadMat = new THREE.MeshStandardMaterial({ map: this.roadTex, roughness: 0.88, metalness: 0.02, clippingPlanes: this.cityKeepClip });
-    const leftRoad = new THREE.Mesh(new THREE.PlaneGeometry(DECK_W, STRIP_LEN), this.leftRoadMat);
-    leftRoad.rotation.x = -Math.PI / 2;
-    leftRoad.scale.x = -1;
-    leftRoad.position.set(-(DECK_W + 2.2), -0.005, mid);
-    leftRoad.receiveShadow = true;
-    this.scene.add(leftRoad);
+    const railMat = new THREE.MeshStandardMaterial({ color: 0xc4c8cc, metalness: 0.85, roughness: 0.35, clippingPlanes: this.bridgeClip, clipIntersection: true });
     for (const side of [-1, 1]) {
       const gravel = new THREE.Mesh(new THREE.PlaneGeometry(2.2, STRIP_LEN), gravelMat);
       gravel.rotation.x = -Math.PI / 2;
@@ -1532,6 +1522,17 @@ export class Scene3D {
     this.grassTex.offset.y = (pz / 8) % 1;
     this.layoutScenery(pz, night);
     this.placeLandmarks(pz);
+    this.clipSpan(this.waterClip, pz, WATER_FROM, WATER_TO);
+    this.clipSpan(this.bridgeClip, pz, BRIDGE_FROM, BRIDGE_TO);
+    if (this.map?.loaded) this.map.update(pz, night, this.time);
+    // Golden hour over the bridge: warm sun and a peach sky.
+    const sunset = sunsetAmount(pz);
+    this.sun.color.copy(this.sunWhite).lerp(this.sunGold, sunset);
+    if (sunset > 0.02) {
+      this.sky.lerp(this.sunsetColor, sunset * 0.55 * (1 - night * 0.6));
+      this.scene.background = this.sky;
+      this.fog.color.lerp(this.sunsetColor, sunset * 0.4);
+    }
 
     // --- sun follows the player for crisp shadows
     this.sun.position.set(playerX + 8, 22, -6);
@@ -1652,6 +1653,7 @@ export class Scene3D {
 
     // Shared material batches: every visible vehicle still draws, with one
     // call per part/material rather than one call per car per part.
+    const oncoming = oncomingCars(pz, this.time, TRAFFIC_DRAW_AHEAD, VIEW_BEHIND);
     for (const [model, parts] of this.trafficBatches) {
       let count = 0;
       let signalCount = 0;
@@ -1708,6 +1710,27 @@ export class Scene3D {
           );
           this.matrix.compose(this.positionVector, this.quaternion, this.scaleVector);
           indicators.setMatrixAt(signalCount++, this.matrix);
+        }
+        count++;
+      }
+      // Decorative oncoming cars (bridge, tunnel's other bore) face the player.
+      for (const car of oncoming) {
+        if (car.model !== model || count >= 128) continue;
+        this.positionVector.set(car.x, 0, car.z);
+        this.quaternion.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, Math.PI);
+        this.scaleVector.set(1, 1, 1);
+        this.matrix.compose(this.positionVector, this.quaternion, this.scaleVector);
+        for (const part of parts) part.setMatrixAt(count, this.matrix);
+        const rig = this.trafficLights.get(model);
+        if (rig) {
+          rig.front.setMatrixAt(count, this.matrix);
+          rig.rear.setMatrixAt(count, this.matrix);
+          rig.frontGlow.setMatrixAt(count, this.matrix);
+          rig.rearGlow.setMatrixAt(count, this.matrix);
+          const a = wiperAngle(this.time, rain, (count * 0.37) % 1);
+          rig.wiper.pivots.forEach((pv, i) =>
+            rig.wipers.setMatrixAt(count * 2 + i, wiperMatrix(this.matrix, pv, rig.wiper.tilt, a, this.wiperTmp)),
+          );
         }
         count++;
       }
@@ -1859,6 +1882,14 @@ export class Scene3D {
     return -(z - pz);
   }
 
+  /** Clip planes hiding [from, to) of the cycle around the view (render z = -(world - pz)). */
+  private clipSpan(planes: THREE.Plane[], pz: number, from: number, to: number) {
+    const near = this.nearest(pz, from);
+    const [a, b] = planes as [THREE.Plane, THREE.Plane];
+    a.constant = -near; // negative side: z < near
+    b.constant = near - (to - from); // negative side: z > far
+  }
+
   private placeLandmarks(pz: number) {
     // tunnel
     const len = TUNNEL_TO - TUNNEL_FROM;
@@ -1867,7 +1898,7 @@ export class Scene3D {
     if (start + len < pz - VIEW_BEHIND) start += CYCLE;
     const tz = -(start - pz);
     this.tunnel.position.z = tz;
-    this.tunnel.visible = tz > -VIEW_AHEAD - 10 && tz - len < VIEW_BEHIND;
+    this.tunnel.visible = !this.newTunnel && tz > -VIEW_AHEAD - 10 && tz - len < VIEW_BEHIND;
 
     const placeSet = (objs: THREE.Group[], positions: number[]) => {
       const zs = positions
@@ -1893,7 +1924,18 @@ export class Scene3D {
     const q = this.quaternion;
     const sc = this.scaleVector;
     const pos = this.positionVector;
-    const tunnelAt = (z: number) => inTunnel(z);
+    // The owner's California highway kit dresses the night highway; the bridge spans water.
+    const cali = this.map?.hasPines ?? false;
+    const onSpan = (z: number) => {
+      const u = cyc(z);
+      return u >= BRIDGE_FROM && u < BRIDGE_TO;
+    };
+    // Lamps: none in the tunnel or on the bridge deck.
+    const tunnelAt = (z: number) => inTunnel(z) || onSpan(z);
+    // Trees / buildings: also cleared around the tunnel hill and where the California kit takes over.
+    const wildAt = (z: number) =>
+      tunnelAt(z) || (cali && zoneAt(z) === "night-highway") ||
+      (this.newTunnel && (inTunnel(z + 70) || inTunnel(z - 70)));
 
     if (this.buildings && this.rooftops) {
       let count = 0;
@@ -1904,7 +1946,7 @@ export class Scene3D {
       ) {
         for (const side of [-1, 1]) {
           const z = n * 28;
-          if (tunnelAt(z)) continue;
+          if (wildAt(z)) continue;
           const h = hash(n * 13 + side),
             height = 12 + hash(n * 5 + side) * 42;
           const x = side * (42 + h * 48),
@@ -1933,6 +1975,7 @@ export class Scene3D {
     for (let n = first; i < 159; n++) {
       const z = n * 4;
       if (z > pz + 160) break;
+      if (onSpan(z)) continue;
       for (const s of [-1, 1]) {
         m.makeTranslation(s * (DECK_W / 2 + 0.55), 0, -(z - pz));
         this.posts.setMatrixAt(i++, m);
@@ -1949,7 +1992,7 @@ export class Scene3D {
       if (z > pz + (this.low ? 120 : VIEW_AHEAD)) break;
       for (const s of [-1, 1]) {
         const hsh = hash(n * 2 + (s > 0 ? 1 : 0));
-        if (hsh < 0.25 || tunnelAt(z)) continue;
+        if (hsh < 0.25 || wildAt(z)) continue;
         const x = s * (DECK_W / 2 + 6 + hsh * 26);
         const k = 0.7 + hash(n * 7.3 + s) * 0.9;
         pos.set(x, 0, -(z - pz));

@@ -1,16 +1,14 @@
 // Owner-supplied map models placed along the road (browser only; render3d owns it).
-// Tunnel tiles, city buildings and roadside pines are InstancedMeshes, so each
+// Tunnel tiles and roadside pines are InstancedMeshes, so each
 // model part is one draw call however many copies are on screen (weak phones).
 import * as THREE from "three";
 import { fetchGlb, parseGlb } from "./models3d";
 import tunnelAsset from "@/assets/map/tunnel.glb.asset.json";
 import bridgeAsset from "@/assets/map/bridge.glb.asset.json";
-import cityAsset from "@/assets/map/city-kit.glb.asset.json";
 import highwayAsset from "@/assets/map/highway-kit.glb.asset.json";
-import { cityPlan, type KitSize, type Placement } from "./city-plan";
 import {
-  BRIDGE_FROM, BRIDGE_LEN, CITY_FROM, CITY_TO, CYCLE, STORE_AT, TUNNEL_FROM, TUNNEL_TILE, TUNNEL_TILES,
-  WATER_FROM, WATER_TO, cyc, inCity, inTunnel, overWater, zoneAt,
+  BRIDGE_FROM, BRIDGE_LEN, CYCLE, STORE_AT, TUNNEL_FROM, TUNNEL_TILE, TUNNEL_TILES, TUNNEL_TO,
+  WATER_FROM, WATER_TO, cyc, inTunnel, overWater, zoneAt,
 } from "./world";
 
 const hash = (n: number) => {
@@ -48,6 +46,14 @@ function instanced(src: THREE.Object3D, cap: number, scene: THREE.Object3D, glow
   src.updateMatrixWorld(true);
   const list = meshesOf(src).map((m) => {
     const g = m.geometry.clone();
+    // Quantized (normalized int) attributes clamp to [-1, 1] when baked: widen to float first.
+    for (const name of Object.keys(g.attributes)) {
+      const a = g.getAttribute(name) as THREE.BufferAttribute;
+      if (a.array instanceof Float32Array && !(a as unknown as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) continue;
+      const out = new Float32Array(a.count * a.itemSize);
+      for (let i = 0; i < a.count; i++) for (let k = 0; k < a.itemSize; k++) out[i * a.itemSize + k] = a.getComponent(i, k);
+      g.setAttribute(name, new THREE.BufferAttribute(out, a.itemSize));
+    }
     g.applyMatrix4(m.matrixWorld);
     const mat = m.material as THREE.MeshStandardMaterial;
     if (/glow/i.test(mat.name) && !glow.includes(mat)) glow.push(mat);
@@ -82,13 +88,10 @@ export class MapScenery {
   private water: THREE.Mesh;
   private waterTex: THREE.Texture;
   private banks: THREE.Mesh[] = [];
-  private kits = new Map<string, Batch>();
-  private plan: { buildings: Placement[]; streets: number[] } = { buildings: [], streets: [] };
+  private mountain: THREE.Group | null = null;
   private pines: Batch | null = null;
   private bgTrees: Batch | null = null;
   private store: THREE.Object3D | null = null;
-  private streetMesh: THREE.InstancedMesh;
-  private cityGround: THREE.Mesh[] = [];
   private m = new THREE.Matrix4();
   private q = new THREE.Quaternion();
   private p = new THREE.Vector3();
@@ -143,75 +146,26 @@ export class MapScenery {
       this.banks.push(bank);
       this.root.add(bank);
     }
-    // City: concrete sidewalks/plazas over the grass and asphalt cross streets.
-    const pave = canvasTex(256, 256, (g) => {
-      g.fillStyle = "#9c9a94";
-      g.fillRect(0, 0, 256, 256);
-      for (let i = 0; i < 4000; i++) {
-        g.fillStyle = ["#a7a59f", "#8f8d87", "#b1aea6"][i % 3]!;
-        g.fillRect(hash(i) * 256, hash(i * 2) * 256, 1 + hash(i * 3) * 2, 1 + hash(i * 4) * 2);
-      }
-      g.strokeStyle = "rgba(60,60,60,0.35)";
-      g.lineWidth = 2;
-      for (let k = 0; k <= 256; k += 64) {
-        g.beginPath(); g.moveTo(k, 0); g.lineTo(k, 256); g.stroke();
-        g.beginPath(); g.moveTo(0, k); g.lineTo(256, k); g.stroke();
-      }
-    });
-    pave.repeat.set(30, 1);
-    const paveMat = new THREE.MeshStandardMaterial({ map: pave, roughness: 0.95, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
-    for (const side of [-1, 1]) {
-      const g = new THREE.Mesh(new THREE.PlaneGeometry(120, 1), paveMat);
-      g.rotation.x = -Math.PI / 2;
-      g.position.set(side > 0 ? 9.4 + 60 : -23.8 - 60, -0.03, 0);
-      g.visible = false;
-      this.cityGround.push(g);
-      this.root.add(g);
-    }
-    const street = canvasTex(512, 64, (g) => {
-      g.fillStyle = "#34363a";
-      g.fillRect(0, 0, 512, 64);
-      for (let i = 0; i < 3000; i++) { g.fillStyle = i % 2 ? "#3c3e42" : "#2e3034"; g.fillRect(hash(i) * 512, hash(i * 2) * 64, 2, 2); }
-      g.fillStyle = "#d9b23a";
-      g.fillRect(0, 30, 512, 4);
-    });
-    street.wrapS = THREE.RepeatWrapping;
-    street.repeat.set(6, 1);
-    this.streetMesh = new THREE.InstancedMesh(
-      new THREE.PlaneGeometry(260, 14).rotateX(-Math.PI / 2),
-      new THREE.MeshStandardMaterial({ map: street, roughness: 0.9, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }),
-      6,
-    );
-    this.streetMesh.frustumCulled = false;
-    this.streetMesh.count = 0;
-    this.root.add(this.streetMesh);
   }
 
   async load() {
     const get = async (url: string) => parseGlb(await fetchGlb(url));
-    const [tunnel, bridge, city, hwy] = await Promise.all([
+    const [tunnel, bridge, hwy] = await Promise.all([
       get(tunnelAsset.url).catch((e) => (console.error("tunnel model", e), null)),
       get(bridgeAsset.url).catch((e) => (console.error("bridge model", e), null)),
-      get(cityAsset.url).catch((e) => (console.error("city model", e), null)),
       get(highwayAsset.url).catch((e) => (console.error("highway model", e), null)),
     ]);
-    if (tunnel) this.tunnelTiles = instanced(tunnel, 4, this.root, this.glow);
+    if (tunnel) {
+      this.tunnelTiles = instanced(tunnel, 4, this.root, this.glow);
+      const box = new THREE.Box3().setFromObject(tunnel);
+      this.mountain = buildMountain(box.min.x, box.max.x, box.max.y);
+      this.mountain.visible = false;
+      this.root.add(this.mountain);
+    }
     if (bridge) {
       this.bridge = bridge;
       bridge.visible = false;
       this.root.add(bridge);
-    }
-    if (city) {
-      const sizes: Record<string, KitSize> = {};
-      for (const node of city.children) {
-        const b = new THREE.Box3().setFromObject(node);
-        sizes[node.name] = { w: b.max.x - b.min.x, d: b.max.z - b.min.z };
-        const cap = node.name === "stoplights" ? 4 : node.name === "streetlamp" ? 1 : 10;
-        this.kits.set(node.name, instanced(node, cap, this.root, this.glow));
-      }
-      delete sizes["stoplights"];
-      delete sizes["streetlamp"];
-      this.plan = cityPlan(sizes, CITY_FROM, CITY_TO);
     }
     if (hwy) {
       const pine = hwy.getObjectByName("pine");
@@ -248,10 +202,16 @@ export class MapScenery {
       for (let i = 0; i < TUNNEL_TILES; i++) {
         const z = this.zOf(pz, TUNNEL_FROM + i * TUNNEL_TILE, TUNNEL_TILE);
         if (!this.visible(z, TUNNEL_TILE, 10)) continue;
-        m.makeTranslation(0, 0, z);
+        m.makeTranslation(0, -0.3, z); // floor under the game road so our lane paint stays on top
         this.tunnelTiles.add(m);
       }
       this.tunnelTiles.commit();
+    }
+    if (this.mountain) {
+      const len = TUNNEL_TO - TUNNEL_FROM;
+      const z = this.zOf(pz, TUNNEL_FROM, len);
+      this.mountain.visible = this.visible(z, len, 260);
+      this.mountain.position.z = z;
     }
     // --- suspension bridge + water + banks
     const bz = this.zOf(pz, BRIDGE_FROM, BRIDGE_LEN);
@@ -274,57 +234,19 @@ export class MapScenery {
       far.rotation.set(-Math.PI / 2 + ang, 0, 0);
       far.position.set(0, -drop / 2, wFar + 14);
     }
-    // --- city: buildings, cross streets with traffic lights, pavements
-    const cz = this.zOf(pz, CITY_FROM, CITY_TO - CITY_FROM);
-    const cityOn = this.visible(cz, CITY_TO - CITY_FROM, 40);
-    for (const g of this.cityGround) {
-      g.visible = cityOn;
-      if (!cityOn) continue;
-      const a = Math.min(cz, this.behind + 20);
-      const b = Math.max(cz - (CITY_TO - CITY_FROM), -this.ahead - 20);
-      g.scale.set(1, Math.max(0.01, a - b), 1);
-      g.position.z = (a + b) / 2;
-      ((g.material as THREE.MeshStandardMaterial).map as THREE.Texture).repeat.set(30, Math.max(1, (a - b) / 4));
-      ((g.material as THREE.MeshStandardMaterial).map as THREE.Texture).offset.y = (-b % 4) / 4;
-    }
-    let streets = 0;
-    const lights = this.kits.get("stoplights");
-    if (cityOn) {
-      for (const pl of this.plan.buildings) {
-        const z = this.zOf(pz, pl.at);
-        if (!this.visible(z, 0, 40)) continue;
-        const kit = this.kits.get(pl.type);
-        if (!kit) continue;
-        q.setFromAxisAngle(up, pl.yaw);
-        p.set(pl.x, 0, z);
-        m.compose(p, q, s.set(1, 1, 1));
-        kit.add(m);
-      }
-      for (const at of this.plan.streets) {
-        const z = this.zOf(pz, at);
-        if (!this.visible(z, 0, 20)) continue;
-        m.makeTranslation(-8, -0.02, z);
-        this.streetMesh.setMatrixAt(streets++, m);
-        if (lights) { m.makeTranslation(0, 0, z); lights.add(m); }
-      }
-    }
-    this.streetMesh.count = streets;
-    this.streetMesh.visible = streets > 0;
-    this.streetMesh.instanceMatrix.needsUpdate = true;
-    for (const kit of this.kits.values()) kit.commit();
-    // --- pines + background tree walls along both highways
+    // --- pines + background tree walls along the California night highway
     const reach = this.low ? 150 : this.ahead;
     if (this.pines) {
       const first = Math.floor((pz - this.behind) / 9);
       for (let n = first; n * 9 < pz + reach; n++) {
         const wz = n * 9;
         const zone = zoneAt(wz);
-        if (zone !== "highway" && zone !== "night-highway") continue;
-        if (overWater(wz) || inTunnel(wz + 40) || inTunnel(wz - 40) || inCity(wz + 30)) continue;
+        if (zone !== "night-highway") continue;
+        if (overWater(wz) || inTunnel(wz + 40) || inTunnel(wz - 40)) continue;
         for (const side of [-1, 1]) {
           const h = hash(n * 2 + (side > 0 ? 1 : 0));
-          if (h < (zone === "night-highway" ? 0.15 : 0.35)) continue;
-          if (zone === "night-highway" && side > 0 && Math.abs(cyc(wz) - STORE_AT) < 30) continue;
+          if (h < 0.15) continue;
+          if (side > 0 && Math.abs(cyc(wz) - STORE_AT) < 30) continue;
           const k = 0.75 + hash(n * 7.3 + side) * 0.5;
           q.setFromAxisAngle(up, h * 6.28);
           p.set(side * (12 + h * 22), 0, -(wz - pz));
@@ -339,11 +261,11 @@ export class MapScenery {
       for (let n = first; n * 6 < pz + this.ahead; n++) {
         const wz = n * 6;
         const zone = zoneAt(wz);
-        if (zone !== "highway" && zone !== "night-highway") continue;
-        if (overWater(wz) || inTunnel(wz + 60) || inTunnel(wz - 60) || inCity(wz + 30)) continue;
+        if (zone !== "night-highway") continue;
+        if (overWater(wz) || inTunnel(wz + 60) || inTunnel(wz - 60)) continue;
         for (const side of [-1, 1]) {
           const h = hash(n * 5 + side * 3);
-          if (zone === "highway" && h < 0.5) continue;
+          if (side > 0 && Math.abs(cyc(wz) - STORE_AT) < 40) continue;
           const k = 1 + hash(n * 3.3 + side) * 0.6;
           q.setFromAxisAngle(up, h * 6.28);
           p.set(side * (38 + h * 30), 0, -(wz - pz));
@@ -371,4 +293,76 @@ export class MapScenery {
     });
     this.root.removeFromParent();
   }
+}
+
+/**
+ * Rocky hill the tunnel is bored through (the tile model has no ground over it).
+ * Local z spans [-len, 0] like the tunnel; the bores stay open at both portals.
+ */
+function buildMountain(minX: number, maxX: number, top: number) {
+  const len = TUNNEL_TO - TUNNEL_FROM;
+  const W = 520;
+  const segX = 52;
+  const segZ = 60;
+  const mid = (minX + maxX) / 2;
+  const half = (maxX - minX) / 2 + 6;
+  const roof = top + 2.5;
+  const geo = new THREE.PlaneGeometry(W, len + 140, segX, segZ).rotateX(-Math.PI / 2);
+  const pos = geo.attributes["position"] as THREE.BufferAttribute;
+  const colors: number[] = [];
+  const grass = new THREE.Color(0x4f5d31);
+  const rock = new THREE.Color(0x76706a);
+  const dirt = new THREE.Color(0x5f5440);
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i) + mid;
+    const zl = pos.getZ(i) - len / 2; // 0 at the entry portal, -len at the exit
+    const out = Math.max(0, zl, -len - zl); // metres outside the tunnel ends
+    const ridge = 34 + 30 * Math.sin(zl * 0.006 + 1.3) + 14 * Math.sin(zl * 0.021);
+    const dx = Math.max(0, Math.abs(x - mid) - half);
+    const inn = Math.max(0, Math.min(-zl, zl + len)); // metres inside from the nearer portal
+    let h = Math.max(roof, roof + ridge * (1 - Math.exp(-dx / 60)) + Math.min(11, inn * 0.4) + (hash(i) - 0.5) * 3);
+    let z = zl;
+    if (out > 0 && dx < 8) {
+      // Over the road in front of a portal: fold onto the portal edge so the bores stay open.
+      z = zl > 0 ? 0 : -len;
+      h = roof;
+    } else h = Math.max(-1, h * Math.exp(-out / 30) - (out > 0 ? 2 : 0));
+    pos.setXYZ(i, x, h, z);
+    const k = Math.min(1, Math.abs(h - roof) / 40);
+    c.copy(grass).lerp(dirt, hash(i * 3) * 0.5).lerp(rock, k * 0.8 + (hash(i * 7) > 0.85 ? 0.3 : 0));
+    colors.push(c.r, c.g, c.b);
+  }
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, flatShading: true });
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(geo, mat));
+  // Concrete portal facade over each mouth: hides the hill's underside seen from the road.
+  const wallTex = new THREE.CanvasTexture((() => {
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 128;
+    const x = cv.getContext("2d")!;
+    x.fillStyle = "#8d877d";
+    x.fillRect(0, 0, 128, 128);
+    for (let i = 0; i < 1500; i++) { x.fillStyle = i % 2 ? "#99938a" : "#7f796f"; x.fillRect(hash(i) * 128, hash(i * 2) * 128, 2, 2); }
+    x.fillStyle = "rgba(40,36,30,0.35)";
+    for (let k = 0; k < 128; k += 32) x.fillRect(0, k, 128, 2);
+    return cv;
+  })());
+  wallTex.colorSpace = THREE.SRGBColorSpace;
+  wallTex.wrapS = wallTex.wrapT = THREE.RepeatWrapping;
+  const fw = maxX - minX + 26;
+  wallTex.repeat.set(fw / 8, 2);
+  const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.9 });
+  const capMat = new THREE.MeshStandardMaterial({ color: 0x6d685f, roughness: 0.8 });
+  for (const end of [0, 1]) {
+    const z = end === 0 ? 0 : -len;
+    const wall = new THREE.Mesh(new THREE.BoxGeometry(fw, 15, 1.6), wallMat);
+    wall.position.set(mid, top - 0.3 + 7.5, z + (end === 0 ? 0.8 : -0.8));
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(fw + 1, 0.6, 2.4), capMat);
+    cap.position.set(mid, top - 0.3 + 15.2, wall.position.z);
+    g.add(wall, cap);
+  }
+  return g;
 }

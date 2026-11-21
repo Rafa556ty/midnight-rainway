@@ -15,7 +15,7 @@ const hash = (n: number) => {
 export function oncomingCenter(u: number) {
   if (u >= TUNNEL_FROM && u < TUNNEL_TO) return -22.4; // the tunnel's other bore
   if (u >= BRIDGE_FROM && u < BRIDGE_TO) return -14.5; // left half of the bridge deck
-  return -16.6; // city avenue
+  return -14.5;
 }
 
 export const ONCOMING_SLOTS = 14;
