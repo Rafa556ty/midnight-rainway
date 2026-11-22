@@ -17,6 +17,8 @@ const hash = (n: number) => {
 };
 
 export const WATER_LEVEL = -12;
+/** Tunnel tile drop: its floor crown (+0.11) sits just under the game road (y 0). */
+const TUNNEL_Y = -0.15;
 
 class Batch {
   n = 0;
@@ -158,7 +160,7 @@ export class MapScenery {
     if (tunnel) {
       this.tunnelTiles = instanced(tunnel, 4, this.root, this.glow);
       const box = new THREE.Box3().setFromObject(tunnel);
-      this.mountain = buildMountain(box.min.x, box.max.x, box.max.y);
+      this.mountain = buildMountain(box.min.x, box.max.x, box.max.y + TUNNEL_Y);
       this.mountain.visible = false;
       this.root.add(this.mountain);
     }
@@ -202,7 +204,7 @@ export class MapScenery {
       for (let i = 0; i < TUNNEL_TILES; i++) {
         const z = this.zOf(pz, TUNNEL_FROM + i * TUNNEL_TILE, TUNNEL_TILE);
         if (!this.visible(z, TUNNEL_TILE, 10)) continue;
-        m.makeTranslation(0, -0.3, z); // floor under the game road so our lane paint stays on top
+        m.makeTranslation(0, TUNNEL_Y, z); // floor crown just under the game road so our lane paint stays on top
         this.tunnelTiles.add(m);
       }
       this.tunnelTiles.commit();
@@ -296,38 +298,54 @@ export class MapScenery {
 }
 
 /**
- * Rocky hill the tunnel is bored through (the tile model has no ground over it).
- * Local z spans [-len, 0] like the tunnel; the bores stay open at both portals.
+ * Rocky hill the tunnel is bored through (the tile model has no ground over it),
+ * with a solid concrete portal at each end: only the two bores stay open.
+ * Local z spans [-len, 0] like the tunnel.
  */
 function buildMountain(minX: number, maxX: number, top: number) {
   const len = TUNNEL_TO - TUNNEL_FROM;
-  const W = 520;
-  const segX = 52;
-  const segZ = 60;
   const mid = (minX + maxX) / 2;
-  const half = (maxX - minX) / 2 + 6;
-  const roof = top + 2.5;
-  const geo = new THREE.PlaneGeometry(W, len + 140, segX, segZ).rotateX(-Math.PI / 2);
+  const faceHalf = (maxX - minX) / 2 + 16; // portal facade half width
+  const faceTop = top + 7; // facade top edge
+  const ceil = top - 0.75; // underside of the lintel = inside ceiling height at the mouth
+  const roof = faceTop - 0.6; // hill surface right behind the facade
+  const W = 560;
+  const segX = 112;
+  const segZ = 64;
+  const geo = new THREE.PlaneGeometry(W, len + 160, segX, segZ).rotateX(-Math.PI / 2);
   const pos = geo.attributes["position"] as THREE.BufferAttribute;
   const colors: number[] = [];
   const grass = new THREE.Color(0x4f5d31);
   const rock = new THREE.Color(0x76706a);
   const dirt = new THREE.Color(0x5f5440);
   const c = new THREE.Color();
+  const edge = 6; // rows over the 80 m in front of each portal; rows land exactly on both portals
+  const OUT = 80;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i) + mid;
-    const zl = pos.getZ(i) - len / 2; // 0 at the entry portal, -len at the exit
+    const r = Math.round(((len + 160) / 2 - pos.getZ(i)) / ((len + 160) / segZ)); // row 0 = entry side
+    const zl = r <= edge ? OUT - (r * OUT) / edge
+      : r <= segZ - edge ? (-(r - edge) * len) / (segZ - 2 * edge)
+      : -len - ((r - segZ + edge) * OUT) / edge;
     const out = Math.max(0, zl, -len - zl); // metres outside the tunnel ends
+    const dx = Math.abs(x - mid);
     const ridge = 34 + 30 * Math.sin(zl * 0.006 + 1.3) + 14 * Math.sin(zl * 0.021);
-    const dx = Math.max(0, Math.abs(x - mid) - half);
-    const inn = Math.max(0, Math.min(-zl, zl + len)); // metres inside from the nearer portal
-    let h = Math.max(roof, roof + ridge * (1 - Math.exp(-dx / 60)) + Math.min(11, inn * 0.4) + (hash(i) - 0.5) * 3);
+    const side = Math.max(0, dx - faceHalf);
+    const inn = Math.max(0, Math.min(-zl, zl + len));
+    const jitter = (hash(i) - 0.5) * 2.4;
+    const crest = Math.min(28, inn * 0.55) * (0.75 + 0.25 * Math.sin(x * 0.045 + zl * 0.01));
+    let h = roof + ridge * (1 - Math.exp(-side / 50)) + crest + (inn > 2 ? jitter : 0);
     let z = zl;
-    if (out > 0 && dx < 8) {
-      // Over the road in front of a portal: fold onto the portal edge so the bores stay open.
-      z = zl > 0 ? 0 : -len;
-      h = roof;
-    } else h = Math.max(-1, h * Math.exp(-out / 30) - (out > 0 ? 2 : 0));
+    if (out > 0) {
+      if (dx < faceHalf) {
+        // In front of the facade: collapse onto the portal edge (no ground over the bores).
+        z = zl > 0 ? 0 : -len;
+        h = roof;
+      } else {
+        // Embankments beside the portal slope down toward the open road.
+        h = Math.max(-0.6, h * Math.exp(-out / (24 + side * 0.4)) - 1.2) + jitter * 0.4;
+      }
+    }
     pos.setXYZ(i, x, h, z);
     const k = Math.min(1, Math.abs(h - roof) / 40);
     c.copy(grass).lerp(dirt, hash(i * 3) * 0.5).lerp(rock, k * 0.8 + (hash(i * 7) > 0.85 ? 0.3 : 0));
@@ -335,34 +353,51 @@ function buildMountain(minX: number, maxX: number, top: number) {
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   geo.computeVertexNormals();
-  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, flatShading: true });
+  // Double sided: the cheeks beside each portal are seen from below as well.
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, flatShading: true, side: THREE.DoubleSide });
   const g = new THREE.Group();
   g.add(new THREE.Mesh(geo, mat));
-  // Concrete portal facade over each mouth: hides the hill's underside seen from the road.
-  const wallTex = new THREE.CanvasTexture((() => {
-    const cv = document.createElement("canvas");
-    cv.width = cv.height = 128;
-    const x = cv.getContext("2d")!;
+
+  // Portal facades: concrete panels around both bores, a lintel, a median pillar and a cap.
+  const wallTex = canvasTex(128, 128, (x) => {
     x.fillStyle = "#8d877d";
     x.fillRect(0, 0, 128, 128);
     for (let i = 0; i < 1500; i++) { x.fillStyle = i % 2 ? "#99938a" : "#7f796f"; x.fillRect(hash(i) * 128, hash(i * 2) * 128, 2, 2); }
     x.fillStyle = "rgba(40,36,30,0.35)";
-    for (let k = 0; k < 128; k += 32) x.fillRect(0, k, 128, 2);
-    return cv;
-  })());
-  wallTex.colorSpace = THREE.SRGBColorSpace;
-  wallTex.wrapS = wallTex.wrapT = THREE.RepeatWrapping;
-  const fw = maxX - minX + 26;
-  wallTex.repeat.set(fw / 8, 2);
+    for (let k = 0; k < 128; k += 32) { x.fillRect(0, k, 128, 2); x.fillRect(k, 0, 2, 128); }
+    x.fillStyle = "rgba(30,26,22,0.25)"; // rain streaks
+    for (let i = 0; i < 40; i++) x.fillRect(hash(i * 11) * 128, 0, 1 + hash(i * 13) * 2, 40 + hash(i * 17) * 88);
+  });
   const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.9 });
   const capMat = new THREE.MeshStandardMaterial({ color: 0x6d685f, roughness: 0.8 });
+  const stripeTex = canvasTex(64, 8, (x) => {
+    for (let k = 0; k < 8; k++) { x.fillStyle = k % 2 ? "#e8c21a" : "#1d1d1d"; x.fillRect(k * 8, 0, 8, 8); }
+  });
+  stripeTex.repeat.set(12, 1);
+  const stripeMat = new THREE.MeshStandardMaterial({ map: stripeTex, roughness: 0.6 });
+  const T = 1.4; // facade thickness
+  const x0 = mid - faceHalf;
+  const x1 = mid + faceHalf;
+  const box = (ax: number, bx: number, ay: number, by: number, z: number, m: THREE.Material, d = T) => {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(bx - ax, by - ay, d), m);
+    b.position.set((ax + bx) / 2, (ay + by) / 2, z);
+    const tex = (m as THREE.MeshStandardMaterial).map;
+    if (tex === wallTex) {
+      // world-scale UVs so the panel lines keep their size on every block
+      const uv = b.geometry.attributes["uv"] as THREE.BufferAttribute;
+      for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * (bx - ax) / 6, uv.getY(i) * (by - ay) / 6);
+    }
+    g.add(b);
+  };
   for (const end of [0, 1]) {
-    const z = end === 0 ? 0 : -len;
-    const wall = new THREE.Mesh(new THREE.BoxGeometry(fw, 15, 1.6), wallMat);
-    wall.position.set(mid, top - 0.3 + 7.5, z + (end === 0 ? 0.8 : -0.8));
-    const cap = new THREE.Mesh(new THREE.BoxGeometry(fw + 1, 0.6, 2.4), capMat);
-    cap.position.set(mid, top - 0.3 + 15.2, wall.position.z);
-    g.add(wall, cap);
+    const z = end === 0 ? T / 2 : -len - T / 2;
+    box(x0, x1, ceil, faceTop, z, wallMat); // lintel
+    box(x0, minX + 0.9, -1, ceil, z, wallMat); // left jamb
+    box(maxX - 0.7, x1, -1, ceil, z, wallMat); // right jamb (over the walkway)
+    box(-12.4, -10.6, -0.2, ceil, z, wallMat); // pillar between the bores
+    box(x0 - 0.4, x1 + 0.4, faceTop, faceTop + 0.5, z, capMat, T + 1); // cap
+    const sz = end === 0 ? T + 0.02 : -len - T - 0.02;
+    box(minX + 0.9, maxX - 0.7, ceil - 0.01, ceil + 0.45, sz, stripeMat, 0.05); // hazard stripe over the mouth
   }
   return g;
 }

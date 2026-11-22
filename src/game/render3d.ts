@@ -1522,7 +1522,11 @@ export class Scene3D {
     this.grassTex.offset.y = (pz / 8) % 1;
     this.layoutScenery(pz, night);
     this.placeLandmarks(pz);
-    this.clipSpan(this.waterClip, pz, WATER_FROM, WATER_TO);
+    // Grass/gravel are cut out over the river and inside the tunnel (never both in view).
+    const u = cyc(pz);
+    const nearTunnel = u > TUNNEL_FROM - VIEW_AHEAD - 60 && u < TUNNEL_TO + VIEW_BEHIND + 60;
+    if (nearTunnel) this.clipSpan(this.waterClip, pz, TUNNEL_FROM, TUNNEL_TO);
+    else this.clipSpan(this.waterClip, pz, WATER_FROM, WATER_TO);
     this.clipSpan(this.bridgeClip, pz, BRIDGE_FROM, BRIDGE_TO);
     if (this.map?.loaded) this.map.update(pz, night, this.time);
     // Golden hour over the bridge: warm sun and a peach sky.
